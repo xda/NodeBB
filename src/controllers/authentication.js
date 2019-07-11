@@ -152,6 +152,7 @@ authenticationController.registerComplete = function (req, res, next) {
 
 		var callbacks = data.interstitials.reduce(function (memo, cur) {
 			if (cur.hasOwnProperty('callback') && typeof cur.callback === 'function') {
+				req.body.files = req.files;
 				memo.push(function (next) {
 					cur.callback(req.session.registration, req.body, function (err) {
 						// Pass error as second argument so all callbacks are executed
@@ -173,13 +174,13 @@ authenticationController.registerComplete = function (req, res, next) {
 				return res.redirect(nconf.get('relative_path') + '/?register=' + encodeURIComponent(data.message));
 			}
 			if (req.session.returnTo) {
-				res.redirect(req.session.returnTo);
+				res.redirect(nconf.get('relative_path') + req.session.returnTo);
 			} else {
 				res.redirect(nconf.get('relative_path') + '/');
 			}
 		};
 
-		async.parallel(callbacks, function (_blank, err) {
+		async.parallel(callbacks, async function (_blank, err) {
 			if (err.length) {
 				err = err.filter(Boolean).map(function (err) {
 					return err.message;
@@ -199,6 +200,7 @@ authenticationController.registerComplete = function (req, res, next) {
 				const payload = req.session.registration;
 				const uid = payload.uid;
 				delete payload.uid;
+				delete payload.returnTo;
 
 				Object.keys(payload).forEach((prop) => {
 					if (typeof payload[prop] === 'boolean') {
@@ -206,7 +208,8 @@ authenticationController.registerComplete = function (req, res, next) {
 					}
 				});
 
-				user.setUserFields(uid, payload, done);
+				await user.async.setUserFields(uid, payload);
+				done();
 			}
 		});
 	});
@@ -273,13 +276,20 @@ function continueLogin(req, res, next) {
 		if (passwordExpiry && passwordExpiry < Date.now()) {
 			winston.verbose('[auth] Triggering password reset for uid ' + userData.uid + ' due to password policy');
 			req.session.passwordExpired = true;
-			user.reset.generate(userData.uid, function (err, code) {
+
+			async.series({
+				code: async.apply(user.reset.generate, userData.uid),
+				buildHeader: async.apply(middleware.buildHeader, req, res),
+				header: async.apply(middleware.generateHeader, req, res, {}),
+			}, function (err, payload) {
 				if (err) {
 					return helpers.noScriptErrors(req, res, err.message, 403);
 				}
 
 				res.status(200).send({
-					next: nconf.get('relative_path') + '/reset/' + code,
+					next: nconf.get('relative_path') + '/reset/' + payload.code,
+					header: payload.header,
+					config: res.locals.config,
 				});
 			});
 		} else {
@@ -331,6 +341,15 @@ authenticationController.doLogin = function (req, uid, callback) {
 };
 
 authenticationController.onSuccessfulLogin = function (req, uid, callback) {
+	// If already called once, return prematurely
+	if (req.res.locals.user) {
+		if (typeof callback === 'function') {
+			return setImmediate(callback);
+		}
+
+		return true;
+	}
+
 	var uuid = utils.generateUUID();
 
 	req.uid = uid;
@@ -373,6 +392,9 @@ authenticationController.onSuccessfulLogin = function (req, uid, callback) {
 				function (next) {
 					user.updateLastOnlineTime(uid, next);
 				},
+				function (next) {
+					user.updateOnlineUsers(uid, next);
+				},
 			], function (err) {
 				next(err);
 			});
@@ -392,7 +414,7 @@ authenticationController.onSuccessfulLogin = function (req, uid, callback) {
 		if (typeof callback === 'function') {
 			callback(err);
 		} else {
-			return false;
+			return !!err;
 		}
 	});
 };
@@ -427,7 +449,7 @@ authenticationController.localLogin = function (req, username, password, next) {
 					user.isAdminOrGlobalMod(uid, next);
 				},
 				banned: function (next) {
-					user.isBanned(uid, next);
+					user.bans.isBanned(uid, next);
 				},
 				hasLoginPrivilege: function (next) {
 					privileges.global.can('local:login', uid, next);
@@ -464,10 +486,11 @@ authenticationController.logout = function (req, res, next) {
 	if (!req.loggedIn || !req.sessionID) {
 		return res.status(200).send('not-logged-in');
 	}
-
+	const uid = req.uid;
+	const sessionID = req.sessionID;
 	async.waterfall([
 		function (next) {
-			user.auth.revokeSession(req.sessionID, req.uid, next);
+			user.auth.revokeSession(sessionID, uid, next);
 		},
 		function (next) {
 			req.logout();
@@ -478,18 +501,18 @@ authenticationController.logout = function (req, res, next) {
 			});
 		},
 		function (next) {
-			user.setUserField(req.uid, 'lastonline', Date.now() - (meta.config.onlineCutoff * 60000), next);
+			user.setUserField(uid, 'lastonline', Date.now() - (meta.config.onlineCutoff * 60000), next);
 		},
 		function (next) {
-			db.sortedSetRemove('users:online', req.uid, next);
+			db.sortedSetAdd('users:online', Date.now() - (meta.config.onlineCutoff * 60000), uid, next);
 		},
 		function (next) {
-			plugins.fireHook('static:user.loggedOut', { req: req, res: res, uid: req.uid }, next);
+			plugins.fireHook('static:user.loggedOut', { req: req, res: res, uid: uid, sessionID: sessionID }, next);
 		},
 		async.apply(middleware.autoLocale, req, res),
 		function () {
 			// Force session check for all connected socket.io clients with the same session id
-			sockets.in('sess_' + req.sessionID).emit('checkSession', 0);
+			sockets.in('sess_' + sessionID).emit('checkSession', 0);
 			if (req.body.noscript === 'true') {
 				res.redirect(nconf.get('relative_path') + '/');
 			} else {
@@ -531,7 +554,7 @@ function getBanInfo(uid, callback) {
 			});
 		},
 		function (next) {
-			next(new Error(banInfo.expiry ? '[[error:user-banned-reason-until, ' + banInfo.expiry_readable + ', ' + banInfo.reason + ']]' : '[[error:user-banned-reason, ' + banInfo.reason + ']]'));
+			next(new Error(banInfo.banned_until ? '[[error:user-banned-reason-until, ' + banInfo.banned_until_readable + ', ' + banInfo.reason + ']]' : '[[error:user-banned-reason, ' + banInfo.reason + ']]'));
 		},
 	], function (err) {
 		if (err) {

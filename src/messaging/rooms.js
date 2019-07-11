@@ -124,10 +124,8 @@ module.exports = function (Messaging) {
 				if (!inRoom) {
 					return next(new Error('[[error:cant-add-users-to-chat-room]]'));
 				}
-				var now = Date.now();
-				var timestamps = uids.map(function () {
-					return now;
-				});
+				const now = Date.now();
+				const timestamps = uids.map(() => now);
 				db.sortedSetAdd('chat:room:' + roomId + ':uids', timestamps, uids, next);
 			},
 			function (next) {
@@ -188,16 +186,14 @@ module.exports = function (Messaging) {
 	Messaging.leaveRooms = function (uid, roomIds, callback) {
 		async.waterfall([
 			function (next) {
-				var roomKeys = roomIds.map(function (roomId) {
-					return 'chat:room:' + roomId + ':uids';
-				});
+				const roomKeys = roomIds.map(roomId => 'chat:room:' + roomId + ':uids');
 				db.sortedSetsRemove(roomKeys, uid, next);
 			},
 			function (next) {
-				db.sortedSetRemove('uid:' + uid + ':chat:rooms', roomIds, next);
-			},
-			function (next) {
-				db.sortedSetRemove('uid:' + uid + ':chat:rooms:unread', roomIds, next);
+				db.sortedSetRemove([
+					'uid:' + uid + ':chat:rooms',
+					'uid:' + uid + ':chat:rooms:unread',
+				], roomIds, next);
 			},
 			function (next) {
 				async.eachSeries(roomIds, updateOwner, next);
@@ -250,6 +246,13 @@ module.exports = function (Messaging) {
 		}
 		async.waterfall([
 			function (next) {
+				plugins.fireHook('filter:chat.renameRoom', {
+					uid: uid,
+					roomId: roomId,
+					newName: newName,
+				}, next);
+			},
+			function (result, next) {
 				Messaging.isRoomOwner(uid, roomId, next);
 			},
 			function (isOwner, next) {

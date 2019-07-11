@@ -77,6 +77,7 @@ apiController.loadConfig = function (req, callback) {
 		message: translator.escape(validator.escape(meta.config.cookieConsentMessage || '[[global:cookies.message]]')).replace(/\\/g, '\\\\'),
 		dismiss: translator.escape(validator.escape(meta.config.cookieConsentDismiss || '[[global:cookies.accept]]')).replace(/\\/g, '\\\\'),
 		link: translator.escape(validator.escape(meta.config.cookieConsentLink || '[[global:cookies.learn_more]]')).replace(/\\/g, '\\\\'),
+		link_url: translator.escape(validator.escape(meta.config.cookieConsentLinkUrl || 'https://www.cookiesandyou.com')).replace(/\\/g, '\\\\'),
 	};
 
 	async.waterfall([
@@ -133,14 +134,16 @@ apiController.getPostData = function (pid, uid, callback) {
 		post: function (next) {
 			posts.getPostData(pid, next);
 		},
+		voted: async.apply(posts.hasVoted, pid, uid),
 	}, function (err, results) {
 		if (err || !results.post) {
 			return callback(err);
 		}
 
 		var post = results.post;
-		var privileges = results.privileges[0];
+		Object.assign(post, results.voted);
 
+		var privileges = results.privileges[0];
 		if (!privileges.read || !privileges['topics:read']) {
 			return callback();
 		}

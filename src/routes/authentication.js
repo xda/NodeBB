@@ -14,9 +14,9 @@ var loginStrategies = [];
 var Auth = module.exports;
 
 Auth.initialize = function (app, middleware) {
-	const passwortInitMiddleware = passport.initialize();
+	const passportInitMiddleware = passport.initialize();
 	app.use(function passportInitialize(req, res, next) {
-		passwortInitMiddleware(req, res, next);
+		passportInitMiddleware(req, res, next);
 	});
 	const passportSessionMiddleware = passport.session();
 	app.use(function passportSession(req, res, next) {
@@ -58,7 +58,12 @@ Auth.reloadRoutes = function (router, callback) {
 
 	async.waterfall([
 		function (next) {
-			plugins.fireHook('filter:auth.init', loginStrategies, next);
+			plugins.fireHook('filter:auth.init', loginStrategies, function (err) {
+				if (err) {
+					winston.error('[authentication] ' + err.stack);
+				}
+				next(null, loginStrategies);
+			});
 		},
 		function (loginStrategies, next) {
 			loginStrategies = loginStrategies || [];
@@ -100,19 +105,32 @@ Auth.reloadRoutes = function (router, callback) {
 							return helpers.redirect(res, strategy.failureUrl !== undefined ? strategy.failureUrl : '/login');
 						}
 
-						req.login(user, function (err) {
-							if (err) {
-								return next(err);
-							}
-
-							helpers.redirect(res, strategy.successUrl !== undefined ? strategy.successUrl : '/');
-						});
+						res.locals.user = user;
+						res.locals.strategy = strategy;
+						next();
 					})(req, res, next);
+				},
+				Auth.middleware.validateAuth,
+				(req, res, next) => {
+					async.waterfall([
+						async.apply(req.login.bind(req), res.locals.user),
+						async.apply(controllers.authentication.onSuccessfulLogin, req, req.uid),
+					], function (err) {
+						if (err) {
+							return next(err);
+						}
+
+						helpers.redirect(res, strategy.successUrl !== undefined ? strategy.successUrl : '/');
+					});
 				});
 			});
 
-			router.post('/register', Auth.middleware.applyCSRF, Auth.middleware.applyBlacklist, controllers.authentication.register);
-			router.post('/register/complete', Auth.middleware.applyCSRF, Auth.middleware.applyBlacklist, controllers.authentication.registerComplete);
+			var multipart = require('connect-multiparty');
+			var multipartMiddleware = multipart();
+			var middlewares = [multipartMiddleware, Auth.middleware.applyCSRF, Auth.middleware.applyBlacklist];
+
+			router.post('/register', middlewares, controllers.authentication.register);
+			router.post('/register/complete', middlewares, controllers.authentication.registerComplete);
 			router.post('/register/abort', controllers.authentication.registerAbort);
 			router.post('/login', Auth.middleware.applyCSRF, Auth.middleware.applyBlacklist, controllers.authentication.login);
 			router.post('/logout', Auth.middleware.applyCSRF, controllers.authentication.logout);
